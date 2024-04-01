@@ -4,6 +4,10 @@ use argh::FromArgs;
 use libloading::{Library, Symbol};
 use notify::Watcher;
 
+mod plugin;
+
+use plugin::Plugin;
+
 compromise::register!(); // set up hot reloading
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,16 +26,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join(libname);
     let absolute_path = base.join(&relative_path);
 
+    // communication between the watcher thread and the main thread
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
     let mut watcher: notify::RecommendedWatcher = notify::Watcher::new(
         {
             move |res: Result<notify::Event, _>| match res {
                 Ok(event) => {
                     if let notify::EventKind::Create(_) = event.kind {
                         if event.paths.iter().any(|x| x.ends_with(&relative_path)) {
-                            let res = step(&absolute_path);
-                            if let Err(e) = res {
-                                println!("step error: {}", e);
-                            }
+                            // signal to reload the library
+                            tx.send(()).unwrap();
                         }
                     }
                 }
@@ -45,8 +50,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .watch(&base, notify::RecursiveMode::Recursive)
         .unwrap();
 
+    let mut plugin = Some(Plugin::load(&absolute_path).unwrap());
+    let start = std::time::SystemTime::now();
+
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
+
+        if rx.try_recv().is_ok() {
+            println!("==== Reloading ====");
+            plugin = None; // causes the previous plugin to be dropped,
+                           // which will call dlclose.  Without this,
+                           // you'd just be increasing the library's
+                           // refcount.
+            plugin = Some(Plugin::load(&absolute_path)?);
+        }
+
+        if let Some(plugin) = plugin.as_ref() {
+            let s = format!("We've been running for {:?}", start.elapsed().unwrap());
+            let s = std::ffi::CString::new(s)?;
+            unsafe { (plugin.greet)(s.as_ptr()) };
+        }
     }
 }
 
