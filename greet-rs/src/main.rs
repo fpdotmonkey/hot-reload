@@ -1,7 +1,8 @@
 use std::os::raw::c_char;
 
 use argh::FromArgs;
-use libloading::{Library, Symbol};
+use common::{FrameContext, Pixel};
+use minifb::{Key, Window, WindowOptions};
 use notify::Watcher;
 
 mod plugin;
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             move |res: Result<notify::Event, _>| match res {
                 Ok(event) => {
                     if let notify::EventKind::Create(_) = event.kind {
-                        if event.paths.iter().any(|x| x.ends_with(&relative_path)) {
+                        if event.paths.iter().any(|x| x.ends_with(&relative_path)) && args.watch {
                             // signal to reload the library
                             tx.send(()).unwrap();
                         }
@@ -50,12 +51,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .watch(&base, notify::RecursiveMode::Recursive)
         .unwrap();
 
+    const WIDTH: usize = 640;
+    const HEIGHT: usize = 360;
+    let mut pixels: Vec<Pixel> = Vec::with_capacity(WIDTH * HEIGHT);
+    for _ in 0..pixels.capacity() {
+        pixels.push(Pixel {
+            b: 0,
+            g: 0,
+            r: 0,
+            z: 0,
+        });
+    }
+
+    let mut window = Window::new("Playground", WIDTH, HEIGHT, WindowOptions::default())?;
+    window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
+
     let mut plugin = Some(Plugin::load(&absolute_path).unwrap());
     let start = std::time::SystemTime::now();
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
+    while window.is_open() && !window.is_key_down(Key::Escape) {
         if rx.try_recv().is_ok() {
             println!("==== Reloading ====");
             plugin = None; // causes the previous plugin to be dropped,
@@ -66,11 +80,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(plugin) = plugin.as_ref() {
-            let s = format!("We've been running for {:?}", start.elapsed().unwrap());
-            let s = std::ffi::CString::new(s)?;
-            unsafe { (plugin.greet)(s.as_ptr()) };
+            let mut context = FrameContext {
+                width: WIDTH,
+                height: HEIGHT,
+                pixels: &mut pixels[0],
+                ticks: start.elapsed().unwrap().as_millis() as usize,
+            };
+            (plugin.draw)(&mut context);
         }
+
+        window
+            .update_with_buffer(
+                #[allow(clippy::transmute_ptr_to_ptr)]
+                unsafe {
+                    std::mem::transmute(pixels.as_slice())
+                },
+                WIDTH,
+                HEIGHT,
+            )
+            .unwrap();
     }
+
+    Ok(())
 }
 
 #[derive(FromArgs)]
@@ -78,43 +109,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct Args {
     #[argh(switch, description = "enable hot reloading")]
     watch: bool,
-}
-
-fn step(lib_path: &std::path::Path) -> Result<(), libloading::Error> {
-    unsafe {
-        let lib = Library::new(lib_path)?;
-        let greet: Symbol<unsafe extern "C" fn(name: *const c_char)> = lib.get(b"greet")?;
-        #[allow(clippy::transmute_ptr_to_ref)]
-        greet(c"saturday".as_ptr());
-    }
-
-    Ok(())
-}
-
-fn run() {
-    let mut line = String::new();
-    let stdin = std::io::stdin();
-
-    println!("starting up");
-    let n = 3;
-    for _ in 0..n {
-        load_and_print().unwrap();
-
-        println!("------------------");
-        println!("Press Enter to reload, ^C to exit");
-
-        line.clear();
-        stdin.read_line(&mut line).unwrap();
-    }
-
-    println!("Did {n} rounds, stopping");
-}
-
-fn load_and_print() -> Result<Library, libloading::Error> {
-    unsafe {
-        let lib = Library::new("../libgreet-rs/target/debug/libgreet.so")?;
-        let greet: Symbol<unsafe extern "C" fn(name: *const c_char)> = lib.get(b"greet")?;
-        greet(c"reloading".as_ptr());
-        Ok(lib)
-    }
 }
